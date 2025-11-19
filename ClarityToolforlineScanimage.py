@@ -7,8 +7,6 @@
 """
 
 
-
-
 import cv2
 from scipy.signal import detrend
 import numpy as np
@@ -18,6 +16,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
+from resolutionRatioFunc import AcutanceAnalyzer  # Assuming main function is defined in resolutionRatioFunc.py
 
 class TemplateMatcher:
     def __init__(self, threshold=0.9, iou_threshold=0.3):
@@ -304,7 +303,7 @@ class ClarityAnalyzer:
 
 
 
-def mian_arrays(img, template, match_threshold=0.86):
+def mian_arrays(img, template, match_threshold=0.93):
     """Run matching and analysis on numpy arrays (grayscale).
     Returns (rects, df, out_path).
     """
@@ -318,6 +317,10 @@ def mian_arrays(img, template, match_threshold=0.86):
 
     Clarity_values = []
     matched_region_gray_values = []
+
+    Col_line_pairs = []
+    Row_line_pairs = []
+
     for _, row in df.iterrows():
         # ensure coordinates are within image bounds and integers
         x = int(max(0, np.floor(row['x'])))
@@ -346,6 +349,35 @@ def mian_arrays(img, template, match_threshold=0.86):
         tenengrad_value = analyzer.calculate_clarity(matched_region, method="Tenengrad")
         Clarity_values.append(tenengrad_value)
         matched_region_gray_values.append(matched_region_gray_value)
+
+        analyzer = AcutanceAnalyzer(img_array=matched_region)
+        print("\n=== 全局锐度分析 ===")
+        global_results = analyzer.run_analysis(
+            calculate_global=True,
+            fit_threshold=(8,8)  # (行阈值, 列阈值)
+        )
+        col_mean_stddev, row_mean_stddev, single_col_stddev, single_row_stddev = global_results
+        pixSize = 0.5  # 假设像素大小为0.5um，根据实际情况调整
+        Col_line_pairs.append(1000/(2*pixSize*col_mean_stddev))
+        Row_line_pairs.append(1000/(2*pixSize*row_mean_stddev))
+
+    x = df['center_x'].values    
+    plt.figure()
+    plt.plot(x, Col_line_pairs, marker='.', label='Col line pairs')
+    plt.plot(x, Row_line_pairs, marker='.', label='Row line pairs')
+
+    # 画一根y=650的参考线
+    plt.axhline(y=650, color='r', linestyle='--', label='Reference Line (650 lp/mm)')
+
+    plt.legend(['Col line pairs', 'Row line pairs'])
+    plt.title('Resolution Analysis')
+    plt.xlabel('Camera pixel')
+    plt.ylabel('Clarity (line pairs)')
+    plt.grid(True)
+    plt.show()
+
+
+
 
     # If df is empty this will add no column; otherwise attach clarity values
     if not df.empty:
@@ -390,12 +422,14 @@ def mian_arrays(img, template, match_threshold=0.86):
         
         # 6. 调整布局，避免标签重叠
         fig.tight_layout()
-        plot_path = 'clarity_analysis_ui.jpg'
-        plt.savefig(plot_path)
+        plt.show()
 
-        # 用win打开图片查看
-        import os
-        os.startfile(plot_path)
+        # plot_path = 'clarity_analysis_ui.jpg'
+        # plt.savefig(plot_path)
+
+        # # 用win打开图片查看
+        # import os
+        # os.startfile(plot_path)
 
 
     return rects, df, out_path
@@ -415,7 +449,7 @@ class ImageApp:
         open_btn.pack(side=tk.LEFT, padx=4, pady=4)
 
         tk.Label(ctrl, text="Match Threshold:").pack(side=tk.LEFT, padx=(8,2))
-        self.thresh_var = tk.DoubleVar(value=0.86)
+        self.thresh_var = tk.DoubleVar(value=0.93)
         self.thresh_entry = tk.Entry(ctrl, textvariable=self.thresh_var, width=6)
         self.thresh_entry.pack(side=tk.LEFT)
 
