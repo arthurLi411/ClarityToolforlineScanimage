@@ -18,458 +18,9 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 from resolutionRatioFunc import AcutanceAnalyzer  
 from MTFcalc import MTFCalculator
+from TempMatcher import TemplateMatcher
+from ClarityAnalyzer import ClarityAnalyzer
 
-class TemplateMatcher:
-    def __init__(self, threshold=0.9, iou_threshold=0.3):
-        """
-        初始化模板匹配器
-        :param threshold: 匹配阈值
-        :param iou_threshold: NMS的IOU阈值
-        """
-        self.threshold = threshold
-        self.iou_threshold = iou_threshold
-    
-    def subpixel_peak(self, response_map, x, y):
-        """
-        亚像素级峰值定位（使用二次曲面拟合）
-        :param response_map: 匹配结果矩阵
-        :param x: 整数X坐标（列坐标）
-        :param y: 整数Y坐标（行坐标）
-        :return: (x_sub, y_sub) 亚像素级坐标
-        """
-        # 检查边界条件
-        if x < 1 or x >= response_map.shape[1]-1 or y < 1 or y >= response_map.shape[0]-1:
-            return (float(x), float(y))
-
-        # 提取3x3邻域
-        neighborhood = response_map[y-1:y+2, x-1:x+2]
-        
-        # X方向二次拟合
-        dx_num = neighborhood[1, 0] - neighborhood[1, 2]
-        dx_den = 2 * (neighborhood[1, 0] + neighborhood[1, 2] - 2*neighborhood[1, 1])
-        dx = dx_num / dx_den if dx_den != 0 else 0.0
-
-        # Y方向二次拟合
-        dy_num = neighborhood[0, 1] - neighborhood[2, 1]
-        dy_den = 2 * (neighborhood[0, 1] + neighborhood[2, 1] - 2*neighborhood[1, 1])
-        dy = dy_num / dy_den if dy_den != 0 else 0.0
-
-        return (x + dx, y + dy)
-    
-    def nms(self, rects, scores):
-        """
-        非极大值抑制实现
-        :param rects: 包含矩形框的numpy数组，每个元素为[x, y, w, h]
-        :param scores: 每个矩形框的匹配得分
-        :return: 保留的矩形框索引列表
-        """
-        if len(rects) == 0:
-            return []
-            
-        x1 = rects[:, 0]
-        y1 = rects[:, 1]
-        x2 = rects[:, 0] + rects[:, 2]
-        y2 = rects[:, 1] + rects[:, 3]
-
-        areas = rects[:, 2] * rects[:, 3]
-        order = scores.argsort()[::-1]
-
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            
-            # 计算IOU
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-
-            w = np.maximum(0.0, xx2 - xx1)
-            h = np.maximum(0.0, yy2 - yy1)
-            intersection = w * h
-
-            iou = intersection / (areas[i] + areas[order[1:]] - intersection + 1e-8)
-            inds = np.where(iou <= self.iou_threshold)[0]
-            order = order[inds + 1]
-
-        return keep
-    
-    def match(self, img, template):
-        """
-        执行模板匹配并返回匹配结果
-        :param img: 输入图像
-        :param template: 模板图像
-        :return: 包含匹配矩形框的numpy数组
-        """
-        if img is None or template is None:
-            raise ValueError("无法读取图像或模板")
-
-        self.t_h, self.t_w = template.shape[:2]
-        
-        # 执行模板匹配
-        self.result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-
-        # 根据分数阈值收集候选点
-        loc = np.where(self.result >= self.threshold)
-        if len(loc[0]) == 0:
-            print("未找到匹配目标")
-            # return empty rectangles and an empty DataFrame with expected columns
-            empty_rects = np.empty((0, 4), dtype=np.float32)
-            df = pd.DataFrame(columns=['center_x', 'center_y', 'x', 'y', 'w', 'h']).astype(np.float32)
-            return empty_rects, df
-
-        rects = []
-        scores = []
-        for pt in zip(*loc[::-1]):  # pt = (x, y)
-            x, y = pt
-            # 亚像素修正
-            x_sub, y_sub = self.subpixel_peak(self.result, x, y)
-            
-            # 收集数据
-            rects.append([x_sub, y_sub, float(self.t_w), float(self.t_h)])
-            scores.append(self.result[y, x])  # 使用原始得分
-
-        # 转换为numpy数组
-        rects = np.array(rects)
-        scores = np.array(scores)
-
-        # 执行NMS
-        keep = self.nms(rects, scores)
-        final_rects = rects[keep]
-        print(final_rects)
-
-        # 构建DataFrame
-        data = []
-        img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        for rect in final_rects:
-                x, y, w, h = rect
-                center_x = x + w/2.0
-                center_y = y + h/2.0
-                
-                # 记录数据
-                data.append({
-                    'center_x': round(center_x, 2),
-                    'center_y': round(center_y, 2),
-                    'x': round(x, 2),
-                    'y': round(y, 2),
-                    'w': round(w, 2),
-                    'h': round(h, 2)
-                })
-            
-        # 创建DataFrame
-        df = pd.DataFrame(data)
-        df = df.astype(np.float32)  # 确保所有列为浮点型
-        df = df.sort_values(by='center_x', ascending=True).reset_index(drop=True) # 按 center_x 升序排序，并重置索引
-
-        return final_rects, df
-    
-    def draw_rectangles(self, img, rects, output_path='detection_result.jpg', color=(0, 0, 255)):
-        """
-        在图像上绘制矩形框并保存结果
-        :param img: 输入图像
-        :param rects: 包含矩形框的数组list, 每个元素为[x, y, w, h]
-        :param output_path: 结果图像保存路径
-        :param color: 矩形框颜色
-        :return: 包含检测结果的DataFrame
-        """
-        data = []
-        # 如果是灰度图则转换为彩色
-        if len(img.shape) == 2:
-            img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        else:
-            img_color = img.copy()
-
-        for rect in rects:
-            x, y, w, h = rect
-            center_x = x + w/2.0
-            center_y = y + h/2.0
-            
-            # 记录数据
-            data.append({
-                'center_x': round(center_x, 2),
-                'center_y': round(center_y, 2),
-                'x': round(x, 2),
-                'y': round(y, 2),
-                'width': round(w, 2),
-                'height': round(h, 2)
-            })
-            
-            # 绘制图形
-            cv2.rectangle(img_color, 
-                          (int(x), int(y)), 
-                          (int(x + w), int(y + h)), 
-                          color, 2)
-            cv2.circle(img_color, 
-                      (int(round(center_x)), int(round(center_y))), 
-                      3, (0, 255, 0), -1)
-
-        # 保存结果图
-        cv2.imwrite(output_path, img_color)
-        print(f"结果图已保存为 {output_path}")
-        
-        return
-
-
-class ClarityAnalyzer:
-    """图像清晰度分析器，支持多种清晰度计算方法"""
-    def __init__(self):
-        self.methods = {
-            "Tenengrad": self.calculate_tenengrad,
-            "Brenner": self.calculate_brenner,
-            "Entropy": self.calculate_entropy
-        }
-
-    def calculate_tenengrad(self, image):
-        """计算Tenengrad清晰度值"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        
-        # 使用Sobel算子计算梯度
-        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        
-        # 计算梯度平方和
-        grad_squared = grad_x**2 + grad_y**2
-        tenengrad_value = np.sum(grad_squared)
-        
-        return tenengrad_value
-    
-    def calculate_brenner(self, image):
-        """计算Brenner清晰度值"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        
-        # 为避免 uint8 溢出，将灰度图转换为有符号或更大的整数类型
-        # 使用向量化计算水平和垂直方向的二阶差分，速度更快且不会溢出
-        gray = gray.astype(np.int64)
-
-        # 水平方向差分（j 与 j+2）
-        if gray.shape[1] >= 3:
-            horiz = gray[:, 2:] - gray[:, :-2]
-            horiz_sq_sum = np.sum(horiz * horiz, dtype=np.int64)
-        else:
-            horiz_sq_sum = np.int64(0)
-
-        # 垂直方向差分（i 与 i+2）
-        if gray.shape[0] >= 3:
-            vert = gray[2:, :] - gray[:-2, :]
-            vert_sq_sum = np.sum(vert * vert, dtype=np.int64)
-        else:
-            vert_sq_sum = np.int64(0)
-
-        brenner_value = horiz_sq_sum + vert_sq_sum
-
-        # 返回 Python 原生 int（或需要时可返回 float）
-        return int(brenner_value)
-    
-    def calculate_entropy(self, image):
-        """计算信息熵清晰度值"""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        
-        # 计算灰度直方图
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        hist = hist.flatten()
-        
-        # 计算概率分布
-        total_pixels = gray.shape[0] * gray.shape[1]
-        prob = hist / total_pixels
-        
-        # 计算信息熵
-        entropy_value = 0
-        for p in prob:
-            if p > 0:
-                entropy_value -= p * np.log2(p)
-        
-        return entropy_value
-    
-    def calculate_clarity(self, image, method="Tenengrad"):
-        """根据选择的方法计算清晰度值"""
-        if method == "Tenengrad":
-            return self.calculate_tenengrad(image)
-        elif method == "Brenner":
-            return self.calculate_brenner(image)
-        elif method == "Entropy":
-            return self.calculate_entropy(image)
-        else:
-            return self.calculate_tenengrad(image)  # 默认使用Tenengrad    
-
-
-
-def mian_arrays(img, template, match_threshold=0.93, pixel_size=0.4994, standard_line=500, attenuation_coefficient=1.0, calculate_global=True, fit_threshold=(2, 2)):
-    # new params calcualte_global and fit_threshold are provided via function args in UI caller
-    """
-    主函数：执行模板匹配和清晰度分析，并绘制结果图表
-    :param img: 输入图像（numpy数组）
-    :param template: 模板图像（numpy数组）
-    :param match_threshold: 模板匹配阈值
-    :param pixel_size: 像素大小（微米）
-    :param standard_line: 参考线对数量（lp/mm）
-    :param attenuation_coefficient: 衰减系数
-    :return: 匹配矩形框数组，包含分析结果的DataFrame，结果图像保存路径
-    """
-    if img is None or template is None:
-        raise ValueError('img and template must be provided')
-    ## TODO 1：模板匹配
-    matcher = TemplateMatcher(threshold=match_threshold, iou_threshold=0.2)
-    rects, df = matcher.match(img, template)
-    out_path = 'detection_result_ui.jpg'
-    matcher.draw_rectangles(img, rects, output_path=out_path)
-
-    Clarity_values = []
-    matched_region_gray_values = []
-
-    Col_line_pairs = []
-    Row_line_pairs = []
-    
-
-    for _, row in df.iterrows(): # 遍历DataFrame每一行，取出匹配区域进行清晰度分析
-        # 提取匹配区域坐标和尺寸
-        x = int(max(0, np.floor(row['x'])))
-        y = int(max(0, np.floor(row['y'])))
-        w = int(max(0, np.ceil(row['w'])))
-        h = int(max(0, np.ceil(row['h'])))
-
-        # 确保区域在图像范围内
-        x1 = min(x + w, img.shape[1])
-        y1 = min(y + h, img.shape[0])
-        x0 = max(0, x)
-        y0 = max(0, y)
-
-        if x0 >= x1 or y0 >= y1:
-            # 无效区域，跳过
-            Clarity_values.append(np.nan)
-            continue
-
-        # 提取匹配区域
-        matched_region = img[y0:y1, x0:x1]
-        matched_region_gray_value = cv2.mean(matched_region)[0]
-
-        if matched_region.size == 0:
-            # 空区域，跳过
-            Clarity_values.append(np.nan)
-            continue
-
-        ## TODO 2：清晰度分析
-        analyzer = ClarityAnalyzer()
-        tenengrad_value = analyzer.calculate_clarity(matched_region, method="Tenengrad")
-        Clarity_values.append(tenengrad_value)
-        matched_region_gray_values.append(matched_region_gray_value)
-
-        ## TODO 3：全局锐度分析
-        analyzer = AcutanceAnalyzer(img_array=matched_region)
-        print("\n=== 全局锐度分析 ===")
-        # respect caller-provided calculate_global and fit_threshold (defaults handled by caller)
-        global_results = analyzer.run_analysis(
-            calculate_global=calculate_global,
-            fit_threshold=fit_threshold
-        )
-        col_mean_stddev, row_mean_stddev = global_results
-
-        if col_mean_stddev is None or row_mean_stddev is None:
-            # 无效数据，跳过
-            Col_line_pairs.append(np.nan)
-            Row_line_pairs.append(np.nan)
-            continue
-        
-        ## TODO 4：MTF计算
-        # 使用从调用者传入的衰减系数（默认1.0）
-        # 理论计算值比实际测量偏大15%，用户可通过UI调整该系数以匹配实际测量
-        mtf_calculator = MTFCalculator(
-            pixel_size=pixel_size,    # 像素大小（微米）
-            linepair=standard_line     # 线对数量
-        )
-        mtf_value_Col = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * col_mean_stddev)
-        mtf_value_Row = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * row_mean_stddev)
-
-        # 记录MTF值
-        Col_line_pairs.append(mtf_value_Col)
-        Row_line_pairs.append(mtf_value_Row)
-    
-    # 绘制MTF分析图表
-    x = df['center_x'].values    
-    plt.figure()
-    plt.plot(x, Col_line_pairs, marker='.', label='Col line pairs')
-    plt.plot(x, Row_line_pairs, marker='.', label='Row line pairs')
-
-    # 画参考线（值由调用者/用户指定）
-    plt.axhline(y=0.15, color='r', linestyle='--', label=f'Reference Line ({standard_line} lp/mm)')
-
-    plt.legend(['Col line pairs MTF', 'Row line pairs MTF'])
-    plt.title('Resolution Analysis')
-    plt.xlabel('Camera pixel')
-    plt.ylabel('MTF')
-    plt.grid(True)
-    # plt.show()
-
-    plot_path = 'resolution_analysis_ui.jpg'
-    plt.savefig(plot_path)
-
-    # 用win打开图片查看
-    import os
-    os.startfile(plot_path)
-
-    # If df is empty this will add no column; otherwise attach clarity values
-    if not df.empty:
-        df['Tenengrad_Clarity'] = Clarity_values
-        df['Matched_Region_Gray_Value'] = matched_region_gray_values
-
-    # 绘制清晰度分析图表
-    if not df.empty:
-        # 1. 提取数据
-        x = df['center_x'].values
-        y_distortion = df['center_y'].values
-        y_Clarity = df['Tenengrad_Clarity'].values
-        y_detrended = detrend(y_distortion, type='linear')
-        
-        # 2. 检查关键变量是否存在（避免运行错误）
-        if 'matched_region_gray_values' not in locals():
-            raise ValueError("变量'matched_region_gray_values'未定义，请先提取或定义该数据")
-        
-        # 3. 创建2行1列的子图网格（统一管理图形和轴）
-        fig, (ax_top, ax1) = plt.subplots(2, 1, figsize=(10, 6))  # 2行1列，共享一个figure
-        
-        # 4. 绘制上方子图（去趋势畸变数据）
-        ax_top.plot(x, y_detrended, 'ro')
-        ax_top.set_ylabel('Distortion Detrended (pixs)')
-        ax_top.grid(True)
-        
-        # 5. 绘制下方子图（双Y轴：清晰度 + 灰度值）
-        # # 左Y轴：Tenengrad Clarity（蓝色）
-        # color_blue = 'tab:blue'
-        # ax1.set_xlabel('Camera pixel')
-        # ax1.set_ylabel('Tenengrad Clarity', color=color_blue)
-        # ax1.plot(x, y_Clarity, 'bo')
-        # ax1.tick_params(axis='y', labelcolor=color_blue)
-        ax1.grid(True)
-        
-        # 右Y轴：Matched Region Gray Value（绿色）
-        color_green = 'tab:green'
-        ax2 = ax1.twinx()  # 共享X轴，创建第二个Y轴
-        ax2.set_ylabel('Gray Value', color=color_green)
-        ax2.plot(x, matched_region_gray_values, 'go')
-        ax2.tick_params(axis='y', labelcolor=color_green)
-        
-        # 6. 调整布局，避免标签重叠
-        fig.tight_layout()
-        # plt.show()
-
-        plot_path = 'clarity_analysis_ui.jpg'
-        plt.savefig(plot_path)
-
-        # 用win打开图片查看
-        import os
-        os.startfile(plot_path)
-
-
-    return rects, df, out_path
 
 
 class ImageApp:
@@ -1017,6 +568,175 @@ class ImageApp:
         # Note: preview window removed. The detection result image is still saved to disk
         # at `out_path` and can be opened manually by the user if desired.
         messagebox.showinfo('Done', f'Matching done. Result saved to {out_path}. Rows: {len(df)}')
+
+
+def mian_arrays(img, template, match_threshold=0.93, pixel_size=0.4994, standard_line=500, attenuation_coefficient=1.0, calculate_global=True, fit_threshold=(2, 2)):
+    # new params calcualte_global and fit_threshold are provided via function args in UI caller
+    """
+    主函数：执行模板匹配和清晰度分析，并绘制结果图表
+    :param img: 输入图像（numpy数组）
+    :param template: 模板图像（numpy数组）
+    :param match_threshold: 模板匹配阈值
+    :param pixel_size: 像素大小（微米）
+    :param standard_line: 参考线对数量（lp/mm）
+    :param attenuation_coefficient: 衰减系数
+    :return: 匹配矩形框数组，包含分析结果的DataFrame，结果图像保存路径
+    """
+    if img is None or template is None:
+        raise ValueError('img and template must be provided')
+    ## TODO 1：模板匹配
+    matcher = TemplateMatcher(threshold=match_threshold, iou_threshold=0.2)
+    rects, df = matcher.match(img, template)
+    out_path = 'detection_result_ui.jpg'
+    matcher.draw_rectangles(img, rects, output_path=out_path)
+
+    Clarity_values = []
+    matched_region_gray_values = []
+
+    Col_line_pairs = []
+    Row_line_pairs = []
+    
+
+    for _, row in df.iterrows(): # 遍历DataFrame每一行，取出匹配区域进行清晰度分析
+        # 提取匹配区域坐标和尺寸
+        x = int(max(0, np.floor(row['x'])))
+        y = int(max(0, np.floor(row['y'])))
+        w = int(max(0, np.ceil(row['w'])))
+        h = int(max(0, np.ceil(row['h'])))
+
+        # 确保区域在图像范围内
+        x1 = min(x + w, img.shape[1])
+        y1 = min(y + h, img.shape[0])
+        x0 = max(0, x)
+        y0 = max(0, y)
+
+        if x0 >= x1 or y0 >= y1:
+            # 无效区域，跳过
+            Clarity_values.append(np.nan)
+            continue
+
+        # 提取匹配区域
+        matched_region = img[y0:y1, x0:x1]
+        matched_region_gray_value = cv2.mean(matched_region)[0]
+
+        if matched_region.size == 0:
+            # 空区域，跳过
+            Clarity_values.append(np.nan)
+            continue
+
+        ## TODO 2：清晰度分析
+        analyzer = ClarityAnalyzer()
+        tenengrad_value = analyzer.calculate_clarity(matched_region, method="Tenengrad")
+        Clarity_values.append(tenengrad_value)
+        matched_region_gray_values.append(matched_region_gray_value)
+
+        ## TODO 3：全局锐度分析
+        analyzer = AcutanceAnalyzer(img_array=matched_region)
+        print("\n=== 全局锐度分析 ===")
+        # respect caller-provided calculate_global and fit_threshold (defaults handled by caller)
+        global_results = analyzer.run_analysis(
+            calculate_global=calculate_global,
+            fit_threshold=fit_threshold
+        )
+        col_mean_stddev, row_mean_stddev = global_results
+
+        if col_mean_stddev is None or row_mean_stddev is None:
+            # 无效数据，跳过
+            Col_line_pairs.append(np.nan)
+            Row_line_pairs.append(np.nan)
+            continue
+        
+        ## TODO 4：MTF计算
+        # 使用从调用者传入的衰减系数（默认1.0）
+        # 理论计算值比实际测量偏大15%，用户可通过UI调整该系数以匹配实际测量
+        mtf_calculator = MTFCalculator(
+            pixel_size=pixel_size,    # 像素大小（微米）
+            linepair=standard_line     # 线对数量
+        )
+        mtf_value_Col = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * col_mean_stddev)
+        mtf_value_Row = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * row_mean_stddev)
+
+        # 记录MTF值
+        Col_line_pairs.append(mtf_value_Col)
+        Row_line_pairs.append(mtf_value_Row)
+    
+    # 绘制MTF分析图表
+    x = df['center_x'].values    
+    plt.figure()
+    plt.plot(x, Col_line_pairs, marker='.', label='Col line pairs')
+    plt.plot(x, Row_line_pairs, marker='.', label='Row line pairs')
+
+    # 画参考线（值由调用者/用户指定）
+    plt.axhline(y=0.15, color='r', linestyle='--', label=f'Reference Line ({standard_line} lp/mm)')
+
+    plt.legend(['Col line pairs MTF', 'Row line pairs MTF'])
+    plt.title('Resolution Analysis')
+    plt.xlabel('Camera pixel')
+    plt.ylabel('MTF')
+    plt.grid(True)
+    plt.show()
+
+    # plot_path = 'resolution_analysis_ui.jpg'
+    # plt.savefig(plot_path)
+
+    # # 用win打开图片查看
+    # import os
+    # os.startfile(plot_path)
+
+    # If df is empty this will add no column; otherwise attach clarity values
+    if not df.empty:
+        df['Tenengrad_Clarity'] = Clarity_values
+        df['Matched_Region_Gray_Value'] = matched_region_gray_values
+
+    # 绘制清晰度分析图表
+    if not df.empty:
+        # 1. 提取数据
+        x = df['center_x'].values
+        y_distortion = df['center_y'].values
+        y_Clarity = df['Tenengrad_Clarity'].values
+        y_detrended = detrend(y_distortion, type='linear')
+        
+        # 2. 检查关键变量是否存在（避免运行错误）
+        if 'matched_region_gray_values' not in locals():
+            raise ValueError("变量'matched_region_gray_values'未定义，请先提取或定义该数据")
+        
+        # 3. 创建2行1列的子图网格（统一管理图形和轴）
+        fig, (ax_top, ax1) = plt.subplots(2, 1, figsize=(10, 6))  # 2行1列，共享一个figure
+        
+        # 4. 绘制上方子图（去趋势畸变数据）
+        ax_top.plot(x, y_detrended, 'ro')
+        ax_top.set_ylabel('Distortion Detrended (pixs)')
+        ax_top.grid(True)
+        
+        # 5. 绘制下方子图（双Y轴：清晰度 + 灰度值）
+        # 左Y轴：Tenengrad Clarity（蓝色）
+        color_blue = 'tab:blue'
+        ax1.set_xlabel('Camera pixel')
+        ax1.set_ylabel('Tenengrad Clarity', color=color_blue)
+        ax1.plot(x, y_Clarity, 'bo')
+        ax1.tick_params(axis='y', labelcolor=color_blue)
+        ax1.grid(True)
+        
+        # 右Y轴：Matched Region Gray Value（绿色）
+        color_green = 'tab:green'
+        ax2 = ax1.twinx()  # 共享X轴，创建第二个Y轴
+        ax2.set_ylabel('Gray Value', color=color_green)
+        ax2.plot(x, matched_region_gray_values, 'go')
+        ax2.tick_params(axis='y', labelcolor=color_green)
+        
+        # 6. 调整布局，避免标签重叠
+        fig.tight_layout()
+        plt.show()
+
+        # plot_path = 'clarity_analysis_ui.jpg'
+        # plt.savefig(plot_path)
+
+        # # 用win打开图片查看
+        # import os
+        # os.startfile(plot_path)
+
+
+    return rects, df, out_path
 
 
 if __name__ == '__main__':
