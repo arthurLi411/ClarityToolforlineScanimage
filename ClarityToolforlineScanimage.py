@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-@File    : Tools for Template Matching and Clarity Analysis
+@File    : Tools for Template Matching and Clarity Analysis GUI
 @Author  : Cichun Li
 @Date    : 2025-11-06
-@Copyright: Copyright (c) 2025 Cichun Li. All rights reserved.
+@Copyright (c) 2025 Cichun Li, Alphabetter Co., Ltd. All rights reserved.
 """
 
 
@@ -14,9 +14,10 @@ import pandas as pd
 from matplotlib import pyplot as plt
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 
-from resolutionRatioFunc import AcutanceAnalyzer  # Assuming main function is defined in resolutionRatioFunc.py
+from resolutionRatioFunc import AcutanceAnalyzer  
+from MTFcalc import MTFCalculator
 
 class TemplateMatcher:
     def __init__(self, threshold=0.9, iou_threshold=0.3):
@@ -108,7 +109,6 @@ class TemplateMatcher:
         
         # 执行模板匹配
         self.result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-        print(f"匹配结果矩阵形状: {self.result.shape}")
 
         # 根据分数阈值收集候选点
         loc = np.where(self.result >= self.threshold)
@@ -303,13 +303,21 @@ class ClarityAnalyzer:
 
 
 
-def mian_arrays(img, template, match_threshold=0.93):
-    """Run matching and analysis on numpy arrays (grayscale).
-    Returns (rects, df, out_path).
+def mian_arrays(img, template, match_threshold=0.93, pixel_size=0.4994, standard_line=500, attenuation_coefficient=1.0, calculate_global=True, fit_threshold=(2, 2)):
+    # new params calcualte_global and fit_threshold are provided via function args in UI caller
+    """
+    主函数：执行模板匹配和清晰度分析，并绘制结果图表
+    :param img: 输入图像（numpy数组）
+    :param template: 模板图像（numpy数组）
+    :param match_threshold: 模板匹配阈值
+    :param pixel_size: 像素大小（微米）
+    :param standard_line: 参考线对数量（lp/mm）
+    :param attenuation_coefficient: 衰减系数
+    :return: 匹配矩形框数组，包含分析结果的DataFrame，结果图像保存路径
     """
     if img is None or template is None:
         raise ValueError('img and template must be provided')
-
+    ## TODO 1：模板匹配
     matcher = TemplateMatcher(threshold=match_threshold, iou_threshold=0.2)
     rects, df = matcher.match(img, template)
     out_path = 'detection_result_ui.jpg'
@@ -320,71 +328,100 @@ def mian_arrays(img, template, match_threshold=0.93):
 
     Col_line_pairs = []
     Row_line_pairs = []
+    
 
-    for _, row in df.iterrows():
-        # ensure coordinates are within image bounds and integers
+    for _, row in df.iterrows(): # 遍历DataFrame每一行，取出匹配区域进行清晰度分析
+        # 提取匹配区域坐标和尺寸
         x = int(max(0, np.floor(row['x'])))
         y = int(max(0, np.floor(row['y'])))
         w = int(max(0, np.ceil(row['w'])))
         h = int(max(0, np.ceil(row['h'])))
 
-        # clamp to image
+        # 确保区域在图像范围内
         x1 = min(x + w, img.shape[1])
         y1 = min(y + h, img.shape[0])
         x0 = max(0, x)
         y0 = max(0, y)
 
         if x0 >= x1 or y0 >= y1:
-            # empty region, append NaN and skip clarity calc
+            # 无效区域，跳过
             Clarity_values.append(np.nan)
             continue
 
+        # 提取匹配区域
         matched_region = img[y0:y1, x0:x1]
         matched_region_gray_value = cv2.mean(matched_region)[0]
+
         if matched_region.size == 0:
+            # 空区域，跳过
             Clarity_values.append(np.nan)
             continue
 
+        ## TODO 2：清晰度分析
         analyzer = ClarityAnalyzer()
         tenengrad_value = analyzer.calculate_clarity(matched_region, method="Tenengrad")
         Clarity_values.append(tenengrad_value)
         matched_region_gray_values.append(matched_region_gray_value)
 
+        ## TODO 3：全局锐度分析
         analyzer = AcutanceAnalyzer(img_array=matched_region)
         print("\n=== 全局锐度分析 ===")
+        # respect caller-provided calculate_global and fit_threshold (defaults handled by caller)
         global_results = analyzer.run_analysis(
-            calculate_global=True,
-            fit_threshold=(8,8)  # (行阈值, 列阈值)
+            calculate_global=calculate_global,
+            fit_threshold=fit_threshold
         )
-        col_mean_stddev, row_mean_stddev, single_col_stddev, single_row_stddev = global_results
-        pixSize = 0.5  # 假设像素大小为0.5um，根据实际情况调整
-        Col_line_pairs.append(1000/(2*pixSize*col_mean_stddev))
-        Row_line_pairs.append(1000/(2*pixSize*row_mean_stddev))
+        col_mean_stddev, row_mean_stddev = global_results
 
+        if col_mean_stddev is None or row_mean_stddev is None:
+            # 无效数据，跳过
+            Col_line_pairs.append(np.nan)
+            Row_line_pairs.append(np.nan)
+            continue
+        
+        ## TODO 4：MTF计算
+        # 使用从调用者传入的衰减系数（默认1.0）
+        # 理论计算值比实际测量偏大15%，用户可通过UI调整该系数以匹配实际测量
+        mtf_calculator = MTFCalculator(
+            pixel_size=pixel_size,    # 像素大小（微米）
+            linepair=standard_line     # 线对数量
+        )
+        mtf_value_Col = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * col_mean_stddev)
+        mtf_value_Row = mtf_calculator.calculate_mtf(sigma=pixel_size * attenuation_coefficient * row_mean_stddev)
+
+        # 记录MTF值
+        Col_line_pairs.append(mtf_value_Col)
+        Row_line_pairs.append(mtf_value_Row)
+    
+    # 绘制MTF分析图表
     x = df['center_x'].values    
     plt.figure()
     plt.plot(x, Col_line_pairs, marker='.', label='Col line pairs')
     plt.plot(x, Row_line_pairs, marker='.', label='Row line pairs')
 
-    # 画一根y=650的参考线
-    plt.axhline(y=650, color='r', linestyle='--', label='Reference Line (650 lp/mm)')
+    # 画参考线（值由调用者/用户指定）
+    plt.axhline(y=0.15, color='r', linestyle='--', label=f'Reference Line ({standard_line} lp/mm)')
 
-    plt.legend(['Col line pairs', 'Row line pairs'])
+    plt.legend(['Col line pairs MTF', 'Row line pairs MTF'])
     plt.title('Resolution Analysis')
     plt.xlabel('Camera pixel')
-    plt.ylabel('Clarity (line pairs)')
+    plt.ylabel('MTF')
     plt.grid(True)
-    plt.show()
+    # plt.show()
 
+    plot_path = 'resolution_analysis_ui.jpg'
+    plt.savefig(plot_path)
 
-
+    # 用win打开图片查看
+    import os
+    os.startfile(plot_path)
 
     # If df is empty this will add no column; otherwise attach clarity values
     if not df.empty:
         df['Tenengrad_Clarity'] = Clarity_values
         df['Matched_Region_Gray_Value'] = matched_region_gray_values
 
-    # plotting (same as original mian)
+    # 绘制清晰度分析图表
     if not df.empty:
         # 1. 提取数据
         x = df['center_x'].values
@@ -405,12 +442,12 @@ def mian_arrays(img, template, match_threshold=0.93):
         ax_top.grid(True)
         
         # 5. 绘制下方子图（双Y轴：清晰度 + 灰度值）
-        # 左Y轴：Tenengrad Clarity（蓝色）
-        color_blue = 'tab:blue'
-        ax1.set_xlabel('Camera pixel')
-        ax1.set_ylabel('Tenengrad Clarity', color=color_blue)
-        ax1.plot(x, y_Clarity, 'bo')
-        ax1.tick_params(axis='y', labelcolor=color_blue)
+        # # 左Y轴：Tenengrad Clarity（蓝色）
+        # color_blue = 'tab:blue'
+        # ax1.set_xlabel('Camera pixel')
+        # ax1.set_ylabel('Tenengrad Clarity', color=color_blue)
+        # ax1.plot(x, y_Clarity, 'bo')
+        # ax1.tick_params(axis='y', labelcolor=color_blue)
         ax1.grid(True)
         
         # 右Y轴：Matched Region Gray Value（绿色）
@@ -422,14 +459,14 @@ def mian_arrays(img, template, match_threshold=0.93):
         
         # 6. 调整布局，避免标签重叠
         fig.tight_layout()
-        plt.show()
+        # plt.show()
 
-        # plot_path = 'clarity_analysis_ui.jpg'
-        # plt.savefig(plot_path)
+        plot_path = 'clarity_analysis_ui.jpg'
+        plt.savefig(plot_path)
 
-        # # 用win打开图片查看
-        # import os
-        # os.startfile(plot_path)
+        # 用win打开图片查看
+        import os
+        os.startfile(plot_path)
 
 
     return rects, df, out_path
@@ -440,6 +477,8 @@ class ImageApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Template Matcher UI")
+        # default watermark text (module docstring). Can be overridden externally.
+        self.watermark_text = (__doc__ or '').strip()
 
         # Top controls
         ctrl = tk.Frame(root)
@@ -453,6 +492,35 @@ class ImageApp:
         self.thresh_entry = tk.Entry(ctrl, textvariable=self.thresh_var, width=6)
         self.thresh_entry.pack(side=tk.LEFT)
 
+        tk.Label(ctrl, text="Pixel Size (um):").pack(side=tk.LEFT, padx=(8,2))
+        self.pixel_size_var = tk.DoubleVar(value=0.4994)
+        self.pixel_size_entry = tk.Entry(ctrl, textvariable=self.pixel_size_var, width=8)
+        self.pixel_size_entry.pack(side=tk.LEFT)
+
+        tk.Label(ctrl, text="Reference Line (lp/mm):").pack(side=tk.LEFT, padx=(8,2))
+        self.standard_line_var = tk.DoubleVar(value=500)
+        self.standard_line_entry = tk.Entry(ctrl, textvariable=self.standard_line_var, width=6)
+        self.standard_line_entry.pack(side=tk.LEFT)
+
+        tk.Label(ctrl, text="Attenuation Coef:").pack(side=tk.LEFT, padx=(8,2))
+        self.attenuation_var = tk.DoubleVar(value=1.0)
+        self.attenuation_entry = tk.Entry(ctrl, textvariable=self.attenuation_var, width=6)
+        self.attenuation_entry.pack(side=tk.LEFT)
+
+        # Global fit options
+        self.calculate_global_var = tk.BooleanVar(value=True)
+        self.calculate_global_chk = tk.Checkbutton(ctrl, text='Calculate Global', variable=self.calculate_global_var)
+        self.calculate_global_chk.pack(side=tk.LEFT, padx=(8,2))
+
+        tk.Label(ctrl, text="Fit Threshold (row,col):").pack(side=tk.LEFT, padx=(8,2))
+        self.fit_row_var = tk.IntVar(value=2)
+        self.fit_col_var = tk.IntVar(value=2)
+        self.fit_row_entry = tk.Entry(ctrl, textvariable=self.fit_row_var, width=3)
+        self.fit_row_entry.pack(side=tk.LEFT)
+        tk.Label(ctrl, text=",", pady=0).pack(side=tk.LEFT)
+        self.fit_col_entry = tk.Entry(ctrl, textvariable=self.fit_col_var, width=3)
+        self.fit_col_entry.pack(side=tk.LEFT)
+
         run_btn = tk.Button(ctrl, text="Run Match", command=self.run_match)
         run_btn.pack(side=tk.RIGHT, padx=4)
 
@@ -465,6 +533,9 @@ class ImageApp:
         # Canvas
         self.canvas = tk.Canvas(root, bg='#333333', width=900, height=600)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Recreate watermark when canvas size changes
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
 
         # Bindings: left button = ROI draw, right button = pan, mouse wheel = zoom (center)
         self.canvas.bind('<ButtonPress-1>', self.on_left_press)
@@ -519,7 +590,13 @@ class ImageApp:
     def display_image(self):
         if self.image_pil is None:
             return
-        # resize for current scale
+        # Ensure background watermark canvas items exist (drawn behind image)
+        try:
+            self._ensure_watermark()
+        except Exception:
+            pass
+
+        # resize for current scale using the original PIL image (no compositing)
         w = max(1, int(self.image_pil.width * self.scale))
         h = max(1, int(self.image_pil.height * self.scale))
         resized = self.image_pil.resize((w, h), resample=Image.LANCZOS)
@@ -529,7 +606,17 @@ class ImageApp:
         last_temp = getattr(self, 'last_drawn_roi', None)
         confirmed = getattr(self, 'confirmed_roi', None)
 
-        self.canvas.delete('all')
+        # delete only image and overlays (keep watermark background items)
+        try:
+            if getattr(self, 'image_id', None):
+                self.canvas.delete(self.image_id)
+        except Exception:
+            pass
+        for oid in list(getattr(self, '_overlay_ids', []) or []):
+            try:
+                self.canvas.delete(oid)
+            except Exception:
+                pass
         # create image
         self.image_id = self.canvas.create_image(int(self.offset_x), int(self.offset_y), anchor=tk.NW, image=self.photo)
 
@@ -559,6 +646,115 @@ class ImageApp:
         self._overlay_ids = []
         if self.roi_rect_id:
             self._overlay_ids.append(self.roi_rect_id)
+
+    def _ensure_watermark(self):
+        # draw watermark items once; if already present, do nothing
+        if self.canvas.find_withtag('wm_bg'):
+            return
+        self._draw_watermark()
+
+    def _draw_watermark(self):
+        try:
+            text = (self.watermark_text or '').strip()
+            if not text:
+                return
+
+            # compress to a short single-line if multiline docstring
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            wm_text = ' | '.join(lines[:3]) if lines else ''
+
+            cw = max(1, self.canvas.winfo_width())
+            ch = max(1, self.canvas.winfo_height())
+
+            font_size = max(10, int(min(cw, ch) / 40))
+
+            # create several text items on canvas (they will sit behind the image)
+            positions = [
+                (cw // 2, ch // 2),
+                (cw // 6, ch // 6),
+                (5 * cw // 6, 5 * ch // 6),
+                (cw // 6, 5 * ch // 6),
+                (5 * cw // 6, ch // 6),
+            ]
+
+            # choose a subtle color (no alpha in Tk canvas), let image cover it
+            fill = '#dddddd'
+
+            for (x, y) in positions:
+                tid = self.canvas.create_text(x, y, text=wm_text, fill=fill, font=(None, font_size), tags='wm_bg')
+                # send watermark to the bottom
+                try:
+                    self.canvas.tag_lower(tid)
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    def _on_canvas_configure(self, event):
+        # Recreate watermark when canvas size changes
+        try:
+            # remove existing watermark items
+            for tid in list(self.canvas.find_withtag('wm_bg')):
+                try:
+                    self.canvas.delete(tid)
+                except Exception:
+                    pass
+            self._draw_watermark()
+        except Exception:
+            pass
+
+    def _apply_watermark(self, pil_image):
+        """在 PIL Image 上添加半透明水印文本并返回新的 PIL Image。
+        水印文本从 self.watermark_text 获取；如果为空则直接返回原图。
+        水印位置为中心和四个角的附近，透明度低，不会遮挡主体内容。
+        """
+        try:
+            text = (self.watermark_text or "").strip()
+            if not text:
+                return pil_image
+
+            # 确保是 RGBA
+            base = pil_image.convert("RGBA")
+            w, h = base.size
+
+            overlay = Image.new("RGBA", base.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(overlay)
+
+            # 字体大小随图像尺寸缩放
+            fontsize = max(12, int(min(w, h) / 18))
+            try:
+                font = ImageFont.truetype("arial.ttf", fontsize)
+            except Exception:
+                font = ImageFont.load_default()
+
+            # 文本样式
+            fill = (255, 255, 255, 70)  # 白色半透明
+            shadow = (0, 0, 0, 40)
+
+            # 在图像上绘制多处水印（中心和四角近旁），使用锚点居中绘制
+            positions = [
+                (w // 2, h // 2),
+                (w // 6, h // 6),
+                (5 * w // 6, 5 * h // 6),
+                (w // 6, 5 * h // 6),
+                (5 * w // 6, h // 6),
+            ]
+
+            for (x, y) in positions:
+                # shadow
+                try:
+                    draw.text((x+1, y+1), text, font=font, fill=shadow, anchor="mm")
+                    draw.text((x, y), text, font=font, fill=fill, anchor="mm")
+                except TypeError:
+                    # older PIL may not support anchor; fallback to simple offset
+                    draw.text((x+1, y+1), text, font=font, fill=shadow)
+                    draw.text((x, y), text, font=font, fill=fill)
+
+            # 叠加并返回 RGB 图像
+            combined = Image.alpha_composite(base, overlay).convert("RGB")
+            return combined
+        except Exception:
+            return pil_image
 
     def image_to_canvas(self, ix, iy):
         """Convert image (original) pixel coords to canvas coords"""
@@ -607,10 +803,31 @@ class ImageApp:
         cx1, cy1 = max(x0, x1), max(y0, y1)
         ix0, iy0 = self.canvas_to_image(cx0, cy0)
         ix1, iy1 = self.canvas_to_image(cx1, cy1)
-        ix0 = max(0, min(self.image_pil.width, ix0))
-        ix1 = max(0, min(self.image_pil.width, ix1))
-        iy0 = max(0, min(self.image_pil.height, iy0))
-        iy1 = max(0, min(self.image_pil.height, iy1))
+
+        # Defensive: image_pil may be None if image hasn't finished loading or was cleared.
+        # Fall back to using numpy image (`self.image`) shape when available; if neither is
+        # available, cancel the ROI creation gracefully.
+        if getattr(self, 'image_pil', None) is not None:
+            img_w, img_h = self.image_pil.width, self.image_pil.height
+        elif getattr(self, 'image', None) is not None:
+            # self.image is an RGB numpy array with shape (H, W, ...)
+            img_h, img_w = self.image.shape[0], self.image.shape[1]
+        else:
+            # No image available; abort ROI
+            if self.roi_rect_id:
+                try:
+                    self.canvas.delete(self.roi_rect_id)
+                except Exception:
+                    pass
+            self.roi_rect_id = None
+            self.roi_start = None
+            self.last_drawn_roi = None
+            return
+
+        ix0 = max(0, min(img_w, ix0))
+        ix1 = max(0, min(img_w, ix1))
+        iy0 = max(0, min(img_h, iy0))
+        iy1 = max(0, min(img_h, iy1))
         if abs(ix1-ix0) < 1 or abs(iy1-iy0) < 1:
             if self.roi_rect_id:
                 try:
@@ -742,6 +959,39 @@ class ImageApp:
         except Exception:
             messagebox.showerror('Error', 'Invalid threshold')
             return
+        # read pixel size and reference line from UI
+        try:
+            pixel_size = float(self.pixel_size_var.get())
+            if pixel_size <= 0:
+                raise ValueError()
+        except Exception:
+            messagebox.showerror('Error', 'Invalid pixel size (must be > 0)')
+            return
+
+        try:
+            standard_line = float(self.standard_line_var.get())
+        except Exception:
+            messagebox.showerror('Error', 'Invalid reference line value')
+            return
+        # read attenuation coefficient from UI
+        try:
+            attenuation = float(self.attenuation_var.get())
+            if attenuation <= 0:
+                raise ValueError()
+        except Exception:
+            messagebox.showerror('Error', 'Invalid attenuation coefficient (must be > 0)')
+            return
+        # read global calculation flag and fit thresholds
+        try:
+            calculate_global = bool(self.calculate_global_var.get())
+            fit_row = int(self.fit_row_var.get())
+            fit_col = int(self.fit_col_var.get())
+            if fit_row < 0 or fit_col < 0:
+                raise ValueError()
+            fit_threshold = (fit_row, fit_col)
+        except Exception:
+            messagebox.showerror('Error', 'Invalid fit threshold values (must be integers >= 0)')
+            return
         # extract template from original image (RGB -> GRAY)
         x0, y0, x1, y1 = self.confirmed_roi
         template_rgb = self.image[y0:y1, x0:x1]
@@ -751,27 +1001,21 @@ class ImageApp:
         template_gray = cv2.cvtColor(template_rgb, cv2.COLOR_RGB2GRAY)
         img_gray = cv2.cvtColor(self.image, cv2.COLOR_RGB2GRAY)
         try:
-            rects, df, out_path = mian_arrays(img_gray, template_gray, match_threshold=thresh)
+            rects, df, out_path = mian_arrays(
+                img_gray,
+                template_gray,
+                match_threshold=thresh,
+                pixel_size=pixel_size,
+                standard_line=standard_line,
+                attenuation_coefficient=attenuation,
+                calculate_global=calculate_global,
+                fit_threshold=fit_threshold,
+            )
         except Exception as e:
             messagebox.showerror('Error', f'Matching failed: {e}')
             return
-        # show saved detection result image in a preview window
-        try:
-            preview = tk.Toplevel(self.root)
-            preview.title('Matching Result')
-            pilr = Image.open(out_path)
-            # resize preview to reasonable size if large
-            maxw, maxh = 900, 700
-            rw, rh = pilr.size
-            scale = min(1.0, maxw / rw, maxh / rh)
-            if scale < 1.0:
-                pilr = pilr.resize((int(rw*scale), int(rh*scale)), Image.LANCZOS)
-            photo_r = ImageTk.PhotoImage(pilr)
-            lbl = tk.Label(preview, image=photo_r)
-            lbl.image = photo_r
-            lbl.pack()
-        except Exception:
-            pass
+        # Note: preview window removed. The detection result image is still saved to disk
+        # at `out_path` and can be opened manually by the user if desired.
         messagebox.showinfo('Done', f'Matching done. Result saved to {out_path}. Rows: {len(df)}')
 
 
